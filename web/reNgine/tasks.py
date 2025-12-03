@@ -2384,144 +2384,133 @@ def add_gpt_description_db(title, path, description, impact, remediation, refere
 		gpt_report.references.add(ref)
 		gpt_report.save()
 
-@app.task(name='nuclei_scan', queue='main_scan_queue', base=RengineTask, bind=True)
 def nuclei_scan(self, urls=[], ctx={}, description=None):
-	"""HTTP vulnerability scan using Nuclei
+    """HTTP vulnerability scan using Nuclei (nu ook poorten!)"""
+    # Config (ongewijzigd)
+    config = self.yaml_configuration.get(VULNERABILITY_SCAN) or {}
+    input_path = f'{self.results_dir}/input_endpoints_vulnerability_scan.txt'
+    enable_http_crawl = config.get(ENABLE_HTTP_CRAWL, DEFAULT_ENABLE_HTTP_CRAWL)
+    concurrency = config.get(NUCLEI_CONCURRENCY) or self.yaml_configuration.get(THREADS, DEFAULT_THREADS)
+    intensity = config.get(INTENSITY) or self.yaml_configuration.get(INTENSITY, DEFAULT_SCAN_INTENSITY)
+    rate_limit = config.get(RATE_LIMIT) or self.yaml_configuration.get(RATE_LIMIT, DEFAULT_RATE_LIMIT)
+    retries = config.get(RETRIES) or self.yaml_configuration.get(RETRIES, DEFAULT_RETRIES)
+    timeout = config.get(TIMEOUT) or self.yaml_configuration.get(TIMEOUT, DEFAULT_HTTP_TIMEOUT)
+    custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
+    custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
+    if custom_header:
+        custom_headers.append(custom_header)
+    should_fetch_gpt_report = config.get(FETCH_GPT_REPORT, DEFAULT_GET_GPT_REPORT)
+    proxy = get_random_proxy()
+    nuclei_specific_config = config.get('nuclei', {})
+    use_nuclei_conf = nuclei_specific_config.get(USE_NUCLEI_CONFIG, False)
+    severities = nuclei_specific_config.get(NUCLEI_SEVERITY, NUCLEI_DEFAULT_SEVERITIES)
+    tags = nuclei_specific_config.get(NUCLEI_TAGS, [])
+    tags = ','.join(tags)
+    nuclei_templates = nuclei_specific_config.get(NUCLEI_TEMPLATE)
+    custom_nuclei_templates = nuclei_specific_config.get(NUCLEI_CUSTOM_TEMPLATE)
 
-	Args:
-		urls (list, optional): If passed, filter on those URLs.
-		description (str, optional): Task description shown in UI.
+    # Get alive endpoints (ongewijzigd: full URLs uit wayback/etc.)
+    if urls:
+        with open(input_path, 'w') as f:
+            f.write('\n'.join(urls))
+    else:
+        get_http_urls(
+            is_alive=enable_http_crawl,
+            ignore_files=True,
+            write_filepath=input_path,
+            ctx=ctx
+        )
 
-	Notes:
-	Unfurl the urls to keep only domain and path, will be sent to vuln scan and
-	ignore certain file extensions. Thanks: https://github.com/six2dez/reconftw
-	"""
-	# Config
-	config = self.yaml_configuration.get(VULNERABILITY_SCAN) or {}
-	input_path = f'{self.results_dir}/input_endpoints_vulnerability_scan.txt'
-	enable_http_crawl = config.get(ENABLE_HTTP_CRAWL, DEFAULT_ENABLE_HTTP_CRAWL)
-	concurrency = config.get(NUCLEI_CONCURRENCY) or self.yaml_configuration.get(THREADS, DEFAULT_THREADS)
-	intensity = config.get(INTENSITY) or self.yaml_configuration.get(INTENSITY, DEFAULT_SCAN_INTENSITY)
-	rate_limit = config.get(RATE_LIMIT) or self.yaml_configuration.get(RATE_LIMIT, DEFAULT_RATE_LIMIT)
-	retries = config.get(RETRIES) or self.yaml_configuration.get(RETRIES, DEFAULT_RETRIES)
-	timeout = config.get(TIMEOUT) or self.yaml_configuration.get(TIMEOUT, DEFAULT_HTTP_TIMEOUT)
-	custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
-	'''
-	# TODO: Remove custom_header in next major release
-		support for custom_header will be remove in next major release, 
-		as of now it will be supported for backward compatibility
-		only custom_headers will be supported
-	'''
-	custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
-	if custom_header:
-		custom_headers.append(custom_header)
-	should_fetch_gpt_report = config.get(FETCH_GPT_REPORT, DEFAULT_GET_GPT_REPORT)
-	proxy = get_random_proxy()
-	nuclei_specific_config = config.get('nuclei', {})
-	use_nuclei_conf = nuclei_specific_config.get(USE_NUCLEI_CONFIG, False)
-	severities = nuclei_specific_config.get(NUCLEI_SEVERITY, NUCLEI_DEFAULT_SEVERITIES)
-	tags = nuclei_specific_config.get(NUCLEI_TAGS, [])
-	tags = ','.join(tags)
-	nuclei_templates = nuclei_specific_config.get(NUCLEI_TEMPLATE)
-	custom_nuclei_templates = nuclei_specific_config.get(NUCLEI_CUSTOM_TEMPLATE)
-	# severities_str = ','.join(severities)
+    # *** UNFURL VERWIJDERD: Gebruik altijd volledige URLs (zoals waybackurls) ***
+    # Geen filtering meer op intensity!
 
-	# Get alive endpoints
-	if urls:
-		with open(input_path, 'w') as f:
-			f.write('\n'.join(urls))
-	else:
-		get_http_urls(
-			is_alive=enable_http_crawl,
-			ignore_files=True,
-			write_filepath=input_path,
-			ctx=ctx
-		)
+    # Ports input (nieuw: gegenereerd door port_scan)
+    ports_input_path = f'{self.results_dir}/input_ports_nuclei.txt'
+    enable_ports_scan = True  # Of uit config: config.get('enable_ports_nuclei', True)
 
-	if intensity == 'normal': # reduce number of endpoints to scan
-		unfurl_filter = f'{self.results_dir}/urls_unfurled.txt'
-		run_command(
-			f"cat {input_path} | unfurl -u format %s://%d%p |uro > {unfurl_filter}",
-			shell=True,
-			history_file=self.history_file,
-			scan_id=self.scan_id,
-			activity_id=self.activity_id)
-		run_command(
-			f'sort -u {unfurl_filter} -o  {unfurl_filter}',
-			shell=True,
-			history_file=self.history_file,
-			scan_id=self.scan_id,
-			activity_id=self.activity_id)
-		input_path = unfurl_filter
+    # Update templates (ongewijzigd)
+    run_command(
+        'nuclei -update-templates',
+        shell=True,
+        history_file=self.history_file,
+        scan_id=self.scan_id,
+        activity_id=self.activity_id)
+    templates = []
+    if not (nuclei_templates or custom_nuclei_templates):
+        templates.append(NUCLEI_DEFAULT_TEMPLATES_PATH)
+    if nuclei_templates:
+        if ALL in nuclei_templates:
+            templates.append(NUCLEI_DEFAULT_TEMPLATES_PATH)
+        else:
+            templates.extend(nuclei_templates)
+    if custom_nuclei_templates:
+        custom_nuclei_template_paths = [f'{str(elem)}.yaml' for elem in custom_nuclei_templates]
+        templates.extend(custom_nuclei_template_paths)  # Fix: extend i.p.v. templates.extend() zonder arg
 
-	# Build templates
-	# logger.info('Updating Nuclei templates ...')
-	run_command(
-		'nuclei -update-templates',
-		shell=True,
-		history_file=self.history_file,
-		scan_id=self.scan_id,
-		activity_id=self.activity_id)
-	templates = []
-	if not (nuclei_templates or custom_nuclei_templates):
-		templates.append(NUCLEI_DEFAULT_TEMPLATES_PATH)
+    # Build base CMD (gedeeld voor URLs + ports)
+    base_cmd = 'nuclei -j'
+    if use_nuclei_conf:
+        base_cmd += ' -config /root/.config/nuclei/config.yaml'
+    base_cmd += ' -irr'
+    formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
+    if formatted_headers:
+        base_cmd += f' {formatted_headers}'  # Spatie toevoegen
+    base_cmd += f' -c {str(concurrency)}' if concurrency > 0 else ''
+    base_cmd += f' -proxy {proxy}' if proxy else ''
+    base_cmd += f' -retries {retries}' if retries > 0 else ''
+    base_cmd += f' -rl {rate_limit}' if rate_limit > 0 else ''
+    base_cmd += f' -timeout {str(timeout)}' if timeout and timeout > 0 else ''
+    base_cmd += f' -tags {tags}' if tags else ''
+    base_cmd += ' -silent'
+    for tpl in templates:
+        base_cmd += f' -t {tpl}'
 
-	if nuclei_templates:
-		if ALL in nuclei_templates:
-			template = NUCLEI_DEFAULT_TEMPLATES_PATH
-			templates.append(template)
-		else:
-			templates.extend(nuclei_templates)
+    # CMDs
+    cmd_urls = f'{base_cmd} -l {input_path}'
+    cmd_ports = ''
+    if enable_ports_scan and os.path.exists(ports_input_path):
+        cmd_ports = f'{base_cmd} -l {ports_input_path}'
+        logger.info(f'Ports Nuclei input: {ports_input_path}')
+    else:
+        logger.warning('Geen ports input gevonden, skip ports scan.')
 
-	if custom_nuclei_templates:
-		custom_nuclei_template_paths = [f'{str(elem)}.yaml' for elem in custom_nuclei_templates]
-		template = templates.extend(custom_nuclei_template_paths)
+    # Grouped tasks: Per severity → URLs + Ports
+    grouped_tasks = []
+    custom_ctx = ctx.copy()
+    for severity in severities:
+        custom_ctx['track'] = True
+        
+        # URL scan
+        _task_urls = nuclei_individual_severity_module.si(
+            cmd_urls,
+            severity,
+            enable_http_crawl,
+            should_fetch_gpt_report,
+            ctx=custom_ctx,
+            description=f'Nuclei URLs - {severity}'
+        )
+        grouped_tasks.append(_task_urls)
+        
+        # Ports scan (indien beschikbaar)
+        if cmd_ports:
+            _task_ports = nuclei_individual_severity_module.si(
+                cmd_ports,
+                severity,
+                enable_http_crawl,
+                should_fetch_gpt_report,
+                ctx=custom_ctx,
+                description=f'Nuclei Ports - {severity}'
+            )
+            grouped_tasks.append(_task_ports)
 
-	# Build CMD
-	cmd = 'nuclei -j'
-	cmd += ' -config /root/.config/nuclei/config.yaml' if use_nuclei_conf else ''
-	cmd += f' -irr'
-	formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
-	if formatted_headers:
-		cmd += formatted_headers
-	cmd += f' -l {input_path}'
-	cmd += f' -c {str(concurrency)}' if concurrency > 0 else ''
-	cmd += f' -proxy {proxy} ' if proxy else ''
-	cmd += f' -retries {retries}' if retries > 0 else ''
-	cmd += f' -rl {rate_limit}' if rate_limit > 0 else ''
-	# cmd += f' -severity {severities_str}'
-	cmd += f' -timeout {str(timeout)}' if timeout and timeout > 0 else ''
-	cmd += f' -tags {tags}' if tags else ''
-	cmd += f' -silent'
-	for tpl in templates:
-		cmd += f' -t {tpl}'
+    # Execute (ongewijzigd)
+    celery_group = group(grouped_tasks)
+    job = celery_group.apply_async()
+    while not job.ready():
+        time.sleep(5)
 
-
-	grouped_tasks = []
-	custom_ctx = ctx
-	for severity in severities:
-		custom_ctx['track'] = True
-		_task = nuclei_individual_severity_module.si(
-			cmd,
-			severity,
-			enable_http_crawl,
-			should_fetch_gpt_report,
-			ctx=custom_ctx,
-			description=f'Nuclei Scan with severity {severity}'
-		)
-		grouped_tasks.append(_task)
-
-	celery_group = group(grouped_tasks)
-	job = celery_group.apply_async()
-
-	while not job.ready():
-		# wait for all jobs to complete
-		time.sleep(5)
-
-	logger.info('Vulnerability scan with all severities completed...')
-
-	return None
-
+    logger.info('Nuclei scans (full URLs + Ports) met alle severities voltooid!')
+    return None
 @app.task(name='dalfox_xss_scan', queue='main_scan_queue', base=RengineTask, bind=True)
 def dalfox_xss_scan(self, urls=[], ctx={}, description=None):
 	"""XSS Scan using dalfox
