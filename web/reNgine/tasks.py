@@ -2383,7 +2383,8 @@ def add_gpt_description_db(title, path, description, impact, remediation, refere
 		ref, created = VulnerabilityReference.objects.get_or_create(url=url)
 		gpt_report.references.add(ref)
 		gpt_report.save()
-
+		
+@app.task(name='nuclei_scan', queue='main_scan_queue', base=RengineTask, bind=True)
 def nuclei_scan(self, urls=[], ctx={}, description=None):
     """HTTP vulnerability scan using Nuclei (nu ook poorten!)"""
     # Config (ongewijzigd)
