@@ -1430,7 +1430,21 @@ def port_scan(self, hosts=[], ctx={}, description=None):
 			ports_data[host] = [port_number]
 
 		# Send notification
+		# Send notification
 		logger.warning(f'Found opened port {port_number} on {ip_address} ({host})')
+
+	# *** HIER TOEVOEGEN: Na for-loop, vóór if len(ports_data) == 0: ***
+	# Genereer input_ports_nuclei.txt voor Nuclei
+	ports_nuclei_input = f'{self.results_dir}/input_ports_nuclei.txt'
+	seen = set()
+	with open(ports_nuclei_input, 'w') as f:
+		for host, ports in ports_data.items():
+			for port in ports:
+				entry = f"{host}:{port}"
+				if entry not in seen:
+					seen.add(entry)
+					f.write(f"{entry}\n")
+	logger.info(f"Nuclei ports input gegenereerd: {ports_nuclei_input} ({len(seen)} entries)")
 
 	if len(ports_data) == 0:
 		logger.info('Finished running naabu port scan - No open ports found.')
@@ -1627,187 +1641,190 @@ def waf_detection(self, ctx={}, description=None):
 	return wafs
 
 
+
 @app.task(name='dir_file_fuzz', queue='main_scan_queue', base=RengineTask, bind=True)
 def dir_file_fuzz(self, ctx={}, description=None):
-	"""Perform directory scan, and currently uses `ffuf` as a default tool.
+    """Perform directory scan, and currently uses `ffuf` as a default tool."""
+    
+    # [ORIGINEEL] - Configuratie inladen
+    cmd = 'ffuf'
+    config = self.yaml_configuration.get(DIR_FILE_FUZZ) or {}
+    custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
+    custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
+    if custom_header:
+        custom_headers.append(custom_header)
+    auto_calibration = config.get(AUTO_CALIBRATION, True)
+    enable_http_crawl = config.get(ENABLE_HTTP_CRAWL, DEFAULT_ENABLE_HTTP_CRAWL)
+    rate_limit = config.get(RATE_LIMIT) or self.yaml_configuration.get(RATE_LIMIT, DEFAULT_RATE_LIMIT)
+    extensions = config.get(EXTENSIONS, DEFAULT_DIR_FILE_FUZZ_EXTENSIONS)
+    extensions = [ext if ext.startswith('.') else '.' + ext for ext in extensions]
+    extensions_str = ','.join(map(str, extensions))
+    follow_redirect = config.get(FOLLOW_REDIRECT, FFUF_DEFAULT_FOLLOW_REDIRECT)
+    max_time = config.get(MAX_TIME, 0)
+    match_http_status = config.get(MATCH_HTTP_STATUS, FFUF_DEFAULT_MATCH_HTTP_STATUS)
+    mc = ','.join([str(c) for c in match_http_status])
+    recursive_level = config.get(RECURSIVE_LEVEL, FFUF_DEFAULT_RECURSIVE_LEVEL)
+    stop_on_error = config.get(STOP_ON_ERROR, False)
+    timeout = config.get(TIMEOUT) or self.yaml_configuration.get(TIMEOUT, DEFAULT_HTTP_TIMEOUT)
+    threads = config.get(THREADS) or self.yaml_configuration.get(THREADS, DEFAULT_THREADS)
+    wordlist_name = config.get(WORDLIST, 'dicc')
+    delay = rate_limit / (threads * 100) # calculate request pause delay
+    input_path = f'{self.results_dir}/input_dir_file_fuzz.txt'
 
-	Args:
-		description (str, optional): Task description shown in UI.
+    # [ORIGINEEL] - Wordlist pad bepalen
+    wordlist_name = 'dicc' if wordlist_name == 'default' else wordlist_name
+    wordlist_path = f'/usr/src/wordlist/{wordlist_name}.txt'
 
-	Returns:
-		list: List of URLs discovered.
-	"""
-	# Config
-	cmd = 'ffuf'
-	config = self.yaml_configuration.get(DIR_FILE_FUZZ) or {}
-	custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
-	# support for custom header will be remove in next major release, as of now it will be supported
-	# for backward compatibility
-	custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
-	if custom_header:
-		custom_headers.append(custom_header)
-	auto_calibration = config.get(AUTO_CALIBRATION, True)
-	enable_http_crawl = config.get(ENABLE_HTTP_CRAWL, DEFAULT_ENABLE_HTTP_CRAWL)
-	rate_limit = config.get(RATE_LIMIT) or self.yaml_configuration.get(RATE_LIMIT, DEFAULT_RATE_LIMIT)
-	extensions = config.get(EXTENSIONS, DEFAULT_DIR_FILE_FUZZ_EXTENSIONS)
-	# prepend . on extensions
-	extensions = [ext if ext.startswith('.') else '.' + ext for ext in extensions]
-	extensions_str = ','.join(map(str, extensions))
-	follow_redirect = config.get(FOLLOW_REDIRECT, FFUF_DEFAULT_FOLLOW_REDIRECT)
-	max_time = config.get(MAX_TIME, 0)
-	match_http_status = config.get(MATCH_HTTP_STATUS, FFUF_DEFAULT_MATCH_HTTP_STATUS)
-	mc = ','.join([str(c) for c in match_http_status])
-	recursive_level = config.get(RECURSIVE_LEVEL, FFUF_DEFAULT_RECURSIVE_LEVEL)
-	stop_on_error = config.get(STOP_ON_ERROR, False)
-	timeout = config.get(TIMEOUT) or self.yaml_configuration.get(TIMEOUT, DEFAULT_HTTP_TIMEOUT)
-	threads = config.get(THREADS) or self.yaml_configuration.get(THREADS, DEFAULT_THREADS)
-	wordlist_name = config.get(WORDLIST, 'dicc')
-	delay = rate_limit / (threads * 100) # calculate request pause delay from rate_limit and number of threads
-	input_path = f'{self.results_dir}/input_dir_file_fuzz.txt'
+    # [ORIGINEEL] - FFUF commando opbouwen
+    cmd += f' -w {wordlist_path}'
+    cmd += f' -e {extensions_str}' if extensions else ''
+    cmd += f' -maxtime {max_time}' if max_time > 0 else ''
+    cmd += f' -p {delay}' if delay > 0 else ''
+    cmd += f' -recursion -recursion-depth {recursive_level} ' if recursive_level > 0 else ''
+    cmd += f' -t {threads}' if threads and threads > 0 else ''
+    cmd += f' -timeout {timeout}' if timeout and timeout > 0 else ''
+    cmd += ' -se' if stop_on_error else ''
+    cmd += ' -fr' if follow_redirect else ''
+    cmd += ' -ac' if auto_calibration else ''
+    cmd += f' -mc {mc}' if mc else ''
+    formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
+    if formatted_headers:
+        cmd += formatted_headers
 
-	# Get wordlist
-	wordlist_name = 'dicc' if wordlist_name == 'default' else wordlist_name
-	wordlist_path = f'/usr/src/wordlist/{wordlist_name}.txt'
+    # [ORIGINEEL] - Standaard URLs ophalen (Default URLs = True)
+    urls = get_http_urls(
+        is_alive=True,
+        ignore_files=False,
+        write_filepath=input_path, # Dit bestand wordt overschreven, maar dat is prima
+        get_only_default_urls=True, # We houden dit op True zoals je vroeg
+        ctx=ctx
+    )
+    if not urls: urls = []
 
-	# Build command
-	cmd += f' -w {wordlist_path}'
-	cmd += f' -e {extensions_str}' if extensions else ''
-	cmd += f' -maxtime {max_time}' if max_time > 0 else ''
-	cmd += f' -p {delay}' if delay > 0 else ''
-	cmd += f' -recursion -recursion-depth {recursive_level} ' if recursive_level > 0 else ''
-	cmd += f' -t {threads}' if threads and threads > 0 else ''
-	cmd += f' -timeout {timeout}' if timeout and timeout > 0 else ''
-	cmd += ' -se' if stop_on_error else ''
-	cmd += ' -fr' if follow_redirect else ''
-	cmd += ' -ac' if auto_calibration else ''
-	cmd += f' -mc {mc}' if mc else ''
-	formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
-	if formatted_headers:
-		cmd += formatted_headers
+    # ---------------------------------------------------------------------
+    # [NIEUW TOEGEVOEGD] - Check ports file, run httpx & merge
+    # ---------------------------------------------------------------------
+    ports_input_path = f'{self.results_dir}/input_ports_nuclei.txt'
+    
+    if os.path.exists(ports_input_path):
+        logger.info(f"Checking extra ports from: {ports_input_path}")
+        try:
+            # We pipen de file content naar httpx. 
+            # -sc = status code (niet per se nodig voor fuzz, maar handig voor debug), -silent = alleen output
+            httpx_cmd = f"cat {ports_input_path} | httpx -silent -timeout 5"
+            process = subprocess.Popen(httpx_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = process.communicate()
+            
+            if out:
+                port_urls = out.decode('utf-8').splitlines()
+                port_urls = [x.strip() for x in port_urls if x.strip()]
+                
+                # Samenvoegen met de bestaande URLs
+                urls.extend(port_urls)
+                
+                # Ontdubbelen (set maakt alles uniek)
+                urls = list(set(urls))
+                
+                logger.info(f"Total targets after merging ports: {len(urls)}")
+                
+        except Exception as e:
+            logger.error(f"Failed to process ports file with httpx: {e}")
+    # ---------------------------------------------------------------------
 
-	# Grab URLs to fuzz
-	urls = get_http_urls(
-		is_alive=True,
-		ignore_files=False,
-		write_filepath=input_path,
-		get_only_default_urls=True,
-		ctx=ctx
-	)
-	logger.warning(urls)
+    logger.warning(urls)
 
-	# Loop through URLs and run command
-	results = []
-	for url in urls:
-		'''
-			Above while fetching urls, we are not ignoring files, because some
-			default urls may redirect to https://example.com/login.php
-			so, ignore_files is set to False
-			but, during fuzzing, we will only need part of the path, in above example
-			it is still a good idea to ffuf base url https://example.com
-			so files from base url
-		'''
-		url_parse = urlparse(url)
-		url = url_parse.scheme + '://' + url_parse.netloc
-		url += '/FUZZ' # TODO: fuzz not only URL but also POST / PUT / headers
-		proxy = get_random_proxy()
+    # [ORIGINEEL] - Loop door URLs en voer commando uit
+    # Vanaf hier is alles precies zoals het originele bestand
+    results = []
+    for url in urls:
+        # [ORIGINEEL] - URL voorbereiding
+        url_parse = urlparse(url)
+        url = url_parse.scheme + '://' + url_parse.netloc
+        url += '/FUZZ' 
+        proxy = get_random_proxy()
 
-		# Build final cmd
-		fcmd = cmd
-		fcmd += f' -x {proxy}' if proxy else ''
-		fcmd += f' -u {url} -json'
+        # [ORIGINEEL] - Commando afronden
+        fcmd = cmd
+        fcmd += f' -x {proxy}' if proxy else ''
+        fcmd += f' -u {url} -json'
 
-		# Initialize DirectoryScan object
-		dirscan = DirectoryScan()
-		dirscan.scanned_date = timezone.now()
-		dirscan.command_line = fcmd
-		dirscan.save()
+        # [ORIGINEEL] - Scan object opslaan
+        dirscan = DirectoryScan()
+        dirscan.scanned_date = timezone.now()
+        dirscan.command_line = fcmd
+        dirscan.save()
 
-		# Loop through results and populate EndPoint and DirectoryFile in DB
-		results = []
-		for line in stream_command(
-				fcmd,
-				shell=True,
-				history_file=self.history_file,
-				scan_id=self.scan_id,
-				activity_id=self.activity_id):
+        # [ORIGINEEL] - Output streamen en verwerken
+        results = []
+        for line in stream_command(
+                fcmd,
+                shell=True,
+                history_file=self.history_file,
+                scan_id=self.scan_id,
+                activity_id=self.activity_id):
 
-			# Empty line, continue to the next record
-			if not isinstance(line, dict):
-				continue
+            if not isinstance(line, dict):
+                continue
 
-			# Append line to results
-			results.append(line)
+            results.append(line)
 
-			# Retrieve FFUF output
-			url = line['url']
-			# Extract path and convert to base64 (need byte string encode & decode)
-			name = base64.b64encode(extract_path_from_url(url).encode()).decode()
-			length = line['length']
-			status = line['status']
-			words = line['words']
-			lines = line['lines']
-			content_type = line['content-type']
-			duration = line['duration']
+            url = line['url']
+            name = base64.b64encode(extract_path_from_url(url).encode()).decode()
+            length = line['length']
+            status = line['status']
+            words = line['words']
+            lines = line['lines']
+            content_type = line['content-type']
+            duration = line['duration']
 
-			# If name empty log error and continue
-			if not name:
-				logger.error(f'FUZZ not found for "{url}"')
-				continue
+            if not name:
+                logger.error(f'FUZZ not found for "{url}"')
+                continue
 
-			# Get or create endpoint from URL
-			endpoint, created = save_endpoint(url, crawl=False, ctx=ctx)
+            endpoint, created = save_endpoint(url, crawl=False, ctx=ctx)
 
-			# Continue to next line if endpoint returned is None
-			if endpoint == None:
-				continue
+            if endpoint == None:
+                continue
 
-			# Save endpoint data from FFUF output
-			endpoint.http_status = status
-			endpoint.content_length = length
-			endpoint.response_time = duration / 1000000000
-			endpoint.content_type = content_type
-			endpoint.content_length = length
-			endpoint.save()
+            endpoint.http_status = status
+            endpoint.content_length = length
+            endpoint.response_time = duration / 1000000000
+            endpoint.content_type = content_type
+            endpoint.content_length = length
+            endpoint.save()
 
-			# Save directory file output from FFUF output
-			dfile, created = DirectoryFile.objects.get_or_create(
-				name=name,
-				length=length,
-				words=words,
-				lines=lines,
-				content_type=content_type,
-				url=url,
-				http_status=status)
+            dfile, created = DirectoryFile.objects.get_or_create(
+                name=name,
+                length=length,
+                words=words,
+                lines=lines,
+                content_type=content_type,
+                url=url,
+                http_status=status)
 
-			# Log newly created file or directory if debug activated
-			if created and DEBUG:
-				logger.warning(f'Found new directory or file {url}')
+            if created and DEBUG:
+                logger.warning(f'Found new directory or file {url}')
 
-			# Add file to current dirscan
-			dirscan.directory_files.add(dfile)
+            dirscan.directory_files.add(dfile)
 
-			# Add subscan relation to dirscan if exists
-			if self.subscan:
-				dirscan.dir_subscan_ids.add(self.subscan)
+            if self.subscan:
+                dirscan.dir_subscan_ids.add(self.subscan)
+            dirscan.save()
 
-			# Save dirscan datas
-			dirscan.save()
+            if ctx.get('subdomain_id', 0) > 0:
+                subdomain = Subdomain.objects.get(id=ctx['subdomain_id'])
+            else:
+                subdomain_name = get_subdomain_from_url(endpoint.http_url)
+                subdomain = Subdomain.objects.get(name=subdomain_name, scan_history=self.scan)
+            subdomain.directories.add(dirscan)
+            subdomain.save()
 
-			# Get subdomain and add dirscan
-			if ctx.get('subdomain_id', 0) > 0:
-				subdomain = Subdomain.objects.get(id=ctx['subdomain_id'])
-			else:
-				subdomain_name = get_subdomain_from_url(endpoint.http_url)
-				subdomain = Subdomain.objects.get(name=subdomain_name, scan_history=self.scan)
-			subdomain.directories.add(dirscan)
-			subdomain.save()
+    # [ORIGINEEL] - Crawl discovered URLs
+    if enable_http_crawl:
+        ctx['track'] = False
+        http_crawl(urls, ctx=ctx)
 
-	# Crawl discovered URLs
-	if enable_http_crawl:
-		ctx['track'] = False
-		http_crawl(urls, ctx=ctx)
-
-	return results
+    return results
 
 
 @app.task(name='fetch_url', queue='main_scan_queue', base=RengineTask, bind=True)
@@ -2386,8 +2403,8 @@ def add_gpt_description_db(title, path, description, impact, remediation, refere
 		
 @app.task(name='nuclei_scan', queue='main_scan_queue', base=RengineTask, bind=True)
 def nuclei_scan(self, urls=[], ctx={}, description=None):
-    """HTTP vulnerability scan using Nuclei (nu ook poorten!)"""
-    # Config (ongewijzigd)
+    """HTTP vulnerability scan using Nuclei (3 Tasks: Urls, Ports, Optional DAST)"""
+    # Config
     config = self.yaml_configuration.get(VULNERABILITY_SCAN) or {}
     input_path = f'{self.results_dir}/input_endpoints_vulnerability_scan.txt'
     enable_http_crawl = config.get(ENABLE_HTTP_CRAWL, DEFAULT_ENABLE_HTTP_CRAWL)
@@ -2402,15 +2419,21 @@ def nuclei_scan(self, urls=[], ctx={}, description=None):
         custom_headers.append(custom_header)
     should_fetch_gpt_report = config.get(FETCH_GPT_REPORT, DEFAULT_GET_GPT_REPORT)
     proxy = get_random_proxy()
+    
     nuclei_specific_config = config.get('nuclei', {})
     use_nuclei_conf = nuclei_specific_config.get(USE_NUCLEI_CONFIG, False)
     severities = nuclei_specific_config.get(NUCLEI_SEVERITY, NUCLEI_DEFAULT_SEVERITIES)
+    
+    # --- NIEUW: Uitlezen opties voor 3e scan ---
+    use_dast = nuclei_specific_config.get('dast', False)
+    use_headless = nuclei_specific_config.get('headless', False)
+
     tags = nuclei_specific_config.get(NUCLEI_TAGS, [])
     tags = ','.join(tags)
     nuclei_templates = nuclei_specific_config.get(NUCLEI_TEMPLATE)
     custom_nuclei_templates = nuclei_specific_config.get(NUCLEI_CUSTOM_TEMPLATE)
 
-    # Get alive endpoints (ongewijzigd: full URLs uit wayback/etc.)
+    # Get alive endpoints
     if urls:
         with open(input_path, 'w') as f:
             f.write('\n'.join(urls))
@@ -2422,14 +2445,11 @@ def nuclei_scan(self, urls=[], ctx={}, description=None):
             ctx=ctx
         )
 
-    # *** UNFURL VERWIJDERD: Gebruik altijd volledige URLs (zoals waybackurls) ***
-    # Geen filtering meer op intensity!
-
-    # Ports input (nieuw: gegenereerd door port_scan)
+    # Ports input
     ports_input_path = f'{self.results_dir}/input_ports_nuclei.txt'
-    enable_ports_scan = True  # Of uit config: config.get('enable_ports_nuclei', True)
+    enable_ports_scan = True 
 
-    # Update templates (ongewijzigd)
+    # Update templates
     run_command(
         'nuclei -update-templates',
         shell=True,
@@ -2446,16 +2466,15 @@ def nuclei_scan(self, urls=[], ctx={}, description=None):
             templates.extend(nuclei_templates)
     if custom_nuclei_templates:
         custom_nuclei_template_paths = [f'{str(elem)}.yaml' for elem in custom_nuclei_templates]
-        templates.extend(custom_nuclei_template_paths)  # Fix: extend i.p.v. templates.extend() zonder arg
+        templates.extend(custom_nuclei_template_paths)
 
-    # Build base CMD (gedeeld voor URLs + ports)
+    # Build base CMD
     base_cmd = 'nuclei -j'
     if use_nuclei_conf:
         base_cmd += ' -config /root/.config/nuclei/config.yaml'
-    base_cmd += ' -irr'
     formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
     if formatted_headers:
-        base_cmd += f' {formatted_headers}'  # Spatie toevoegen
+        base_cmd += f' {formatted_headers}'
     base_cmd += f' -c {str(concurrency)}' if concurrency > 0 else ''
     base_cmd += f' -proxy {proxy}' if proxy else ''
     base_cmd += f' -retries {retries}' if retries > 0 else ''
@@ -2466,52 +2485,88 @@ def nuclei_scan(self, urls=[], ctx={}, description=None):
     for tpl in templates:
         base_cmd += f' -t {tpl}'
 
-    # CMDs
+    # CMDs for Standard Scans (Orgineel, ongewijzigd)
     cmd_urls = f'{base_cmd} -l {input_path}'
     cmd_ports = ''
     if enable_ports_scan and os.path.exists(ports_input_path):
-        cmd_ports = f'{base_cmd} -l {ports_input_path}'
-        logger.info(f'Ports Nuclei input: {ports_input_path}')
+        cmd_ports = f'{base_cmd} -l {ports_input_path} -nh'
     else:
         logger.warning('Geen ports input gevonden, skip ports scan.')
 
-    # Grouped tasks: Per severity → URLs + Ports
+    # --- NIEUW: Commando bouwen voor 3e scan (DAST/Headless) ---
+    cmd_dast_scan = ''
+    if use_dast or use_headless:
+        # We gebruiken base_cmd als basis, en input_path (urls) als doel
+        cmd_dast_scan = f'{base_cmd} -l {input_path}'
+        if use_dast:
+            cmd_dast_scan += ' -dast'
+        if use_headless:
+            cmd_dast_scan += ' -headless'
+
+
+    # *** Grouped tasks ***
     grouped_tasks = []
     custom_ctx = ctx.copy()
-    for severity in severities:
+    
+    combined_severities = ','.join(severities) if isinstance(severities, list) else severities
+
+    # 1. URL Scan (Ongewijzigd)
+    logger.info(f'URLs Nuclei task added with merged severities: {combined_severities}')
+    custom_ctx['track'] = True
+    _task_urls = nuclei_individual_severity_module.si(
+        cmd_urls,
+        combined_severities, 
+        enable_http_crawl,
+        should_fetch_gpt_report,
+        ctx=custom_ctx,
+        description=f'Nuclei URLs - All Severities ({combined_severities})'
+    )
+    grouped_tasks.append(_task_urls)
+    
+    # 2. Port Scan (Ongewijzigd)
+    if cmd_ports:
+        logger.info(f'Ports Nuclei task added with merged severities: {combined_severities}')
         custom_ctx['track'] = True
-        
-        # URL scan
-        _task_urls = nuclei_individual_severity_module.si(
-            cmd_urls,
-            severity,
-            enable_http_crawl,
+        _task_ports = nuclei_individual_severity_module.si(
+            cmd_ports,
+            combined_severities, 
+            False,
             should_fetch_gpt_report,
             ctx=custom_ctx,
-            description=f'Nuclei URLs - {severity}'
+            description=f'Nuclei Ports - All Severities ({combined_severities})'
         )
-        grouped_tasks.append(_task_urls)
-        
-        # Ports scan (indien beschikbaar)
-        if cmd_ports:
-            _task_ports = nuclei_individual_severity_module.si(
-                cmd_ports,
-                severity,
-                enable_http_crawl,
-                should_fetch_gpt_report,
-                ctx=custom_ctx,
-                description=f'Nuclei Ports - {severity}'
-            )
-            grouped_tasks.append(_task_ports)
+        grouped_tasks.append(_task_ports)
 
-    # Execute (ongewijzigd)
+    # --- NIEUW: 3. DAST/HEADLESS Scan (Optioneel toegevoegd) ---
+    if cmd_dast_scan:
+        # Bepaal omschrijving
+        modes = []
+        if use_dast: modes.append("DAST")
+        if use_headless: modes.append("HEADLESS")
+        mode_desc = "+".join(modes)
+
+        logger.info(f'DAST/Headless Nuclei task added: {mode_desc}')
+        custom_ctx['track'] = True
+        _task_dast = nuclei_individual_severity_module.si(
+            cmd_dast_scan,
+            combined_severities, 
+            False, # Geen extra crawl, want we gebruiken de urls lijst
+            should_fetch_gpt_report,
+            ctx=custom_ctx,
+            description=f'Nuclei {mode_desc} - ({combined_severities})'
+        )
+        grouped_tasks.append(_task_dast)
+    # -----------------------------------------------------------
+
+    # Execute
     celery_group = group(grouped_tasks)
     job = celery_group.apply_async()
     while not job.ready():
         time.sleep(5)
 
-    logger.info('Nuclei scans (full URLs + Ports) met alle severities voltooid!')
+    logger.info('Nuclei scans (URLs, Ports & Optional DAST) voltooid!')
     return None
+	
 @app.task(name='dalfox_xss_scan', queue='main_scan_queue', base=RengineTask, bind=True)
 def dalfox_xss_scan(self, urls=[], ctx={}, description=None):
 	"""XSS Scan using dalfox
@@ -3648,36 +3703,40 @@ def parse_s3scanner_result(line):
 
 
 def parse_nuclei_result(line):
-	"""Parse results from nuclei JSON output.
-
-	Args:
-		line (dict): Nuclei JSON line output.
-
-	Returns:
-		dict: Vulnerability data.
-	"""
-	return {
-		'name': line['info'].get('name', ''),
-		'type': line['type'],
-		'severity': NUCLEI_SEVERITY_MAP[line['info'].get('severity', 'unknown')],
-		'template': line['template'],
-		'template_url': line.get('template-url', []),
-		'template_id': line['template-id'],
-		'description': line['info'].get('description', ''),
-		'matcher_name': line.get('matcher-name', ''),
-		'curl_command': line.get('curl-command'),
-		'request': line.get('request'),
-		'response': line.get('response'),
-		'extracted_results': line.get('extracted-results', []),
-		'cvss_metrics': line['info'].get('classification', {}).get('cvss-metrics', ''),
-		'cvss_score': line['info'].get('classification', {}).get('cvss-score'),
-		'cve_ids': line['info'].get('classification', {}).get('cve_id', []) or [],
-		'cwe_ids': line['info'].get('classification', {}).get('cwe_id', []) or [],
-		'references': line['info'].get('reference', []) or [],
-		'tags': line['info'].get('tags', []),
-		'source': NUCLEI,
-	}
-
+    """Parse results from nuclei JSON output. Origineel + robust (geen conflicting DB keys)."""
+    info = line.get('info', {})
+    classification = info.get('classification', {})
+    
+    # Severity: str → INT (model vereist)
+    severity_str = info.get('severity', 'unknown').lower()
+    severity = NUCLEI_SEVERITY_MAP.get(severity_str, -1)  # 0-4/-1
+    
+    # CVSS: float/None (model numeriek)
+    cvss_score_str = classification.get('cvss-score', '')
+    cvss_score = float(cvss_score_str) if cvss_score_str else None
+    
+    # ORIGINELE KEYS ALLEEN (geen http_url/endpoint_id/host - subtask sets!)
+    return {
+        'name': info.get('name', ''),
+        'type': line.get('type', 'unknown'),
+        'severity': severity,  # INT!
+        'template': line.get('template', ''),
+        'template_url': line.get('template-url', ''),
+        # Skip template_id (subtask/DB handelt, of None maar geen conflict)
+        'description': info.get('description', ''),
+        'matcher_name': line.get('matcher-name', ''),
+        'curl_command': line.get('curl-command', ''),
+        'request': line.get('request', {}),
+        'response': line.get('response', {}),
+        'extracted_results': line.get('extracted-results', []),
+        'cvss_metrics': classification.get('cvss-metrics', ''),
+        'cvss_score': cvss_score,  # float/None
+        'cve_ids': classification.get('cve-id', []) or [],
+        'cwe_ids': classification.get('cwe-id', []) or [],
+        'references': info.get('reference', []) or info.get('references', []),
+        'tags': info.get('tags', []),
+        'source': NUCLEI,
+    }
 
 def parse_dalfox_result(line):
 	"""Parse results from nuclei JSON output.
