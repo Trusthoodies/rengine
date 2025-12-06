@@ -1695,52 +1695,89 @@ def dir_file_fuzz(self, ctx={}, description=None):
     urls = get_http_urls(
         is_alive=True,
         ignore_files=False,
-        write_filepath=input_path, # Dit bestand wordt overschreven, maar dat is prima
-        get_only_default_urls=True, # We houden dit op True zoals je vroeg
+        write_filepath=input_path, # Dit bestand wordt overschreven
+        get_only_default_urls=True, 
         ctx=ctx
     )
     if not urls: urls = []
 
     # ---------------------------------------------------------------------
-    # [NIEUW TOEGEVOEGD] - Check ports file, run httpx & merge
+    # [NIEUW & GEFIXT 3.0] - Check ports, run httpx with FULL PATH & WRITE
     # ---------------------------------------------------------------------
     ports_input_path = f'{self.results_dir}/input_ports_nuclei.txt'
     
     if os.path.exists(ports_input_path):
         logger.info(f"Checking extra ports from: {ports_input_path}")
         try:
-            # We pipen de file content naar httpx. 
-            # -sc = status code (niet per se nodig voor fuzz, maar handig voor debug), -silent = alleen output
-            httpx_cmd = f"cat {ports_input_path} | httpx -silent -timeout 5"
+            # 1. Bepaal het pad naar httpx
+            # In veel Rengine containers staat httpx in /go/bin/httpx of /usr/local/bin/httpx
+            # We proberen de meest waarschijnlijke, anders fallback op 'httpx' (PATH)
+            httpx_bin = '/go/bin/httpx'
+            if not os.path.exists(httpx_bin):
+                httpx_bin = 'httpx' 
+            
+            # 2. Bouw commando: Gebruik -l flag (stabieler) en -no-color
+            httpx_cmd = f"{httpx_bin} -l {ports_input_path} -silent -timeout 10 -retries 2 -no-color"
+            
+            logger.info(f"Running command: {httpx_cmd}")
+
             process = subprocess.Popen(httpx_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = process.communicate()
             
+            # Log eventuele errors van httpx (niet fataal, maar handig)
+            if err:
+                logger.warning(f"HTTPX Stderr: {err.decode('utf-8', errors='ignore')}")
+
             if out:
-                port_urls = out.decode('utf-8').splitlines()
+                raw_output = out.decode('utf-8', errors='ignore')
+                
+                port_urls = raw_output.splitlines()
                 port_urls = [x.strip() for x in port_urls if x.strip()]
                 
-                # Samenvoegen met de bestaande URLs
-                urls.extend(port_urls)
-                
-                # Ontdubbelen (set maakt alles uniek)
-                urls = list(set(urls))
-                
-                logger.info(f"Total targets after merging ports: {len(urls)}")
+                if port_urls:
+                    logger.info(f"HTTPX found {len(port_urls)} URLs: {port_urls}")
+                    
+                    # Samenvoegen met de bestaande URLs
+                    urls.extend(port_urls)
+                    
+                    # Ontdubbelen (set maakt alles uniek)
+                    urls = list(set(urls))
+                    
+                    logger.info(f"Total targets after merging ports: {len(urls)}")
+                    
+                    # >>> DE FIX: HET TERUGSCHRIJVEN NAAR SCHIJF <<<
+                    with open(input_path, 'w') as f:
+                        f.write('\n'.join(urls))
+                    # >>> EINDE FIX <<<
+                else:
+                    logger.warning("HTTPX ran but returned no valid URLs.")
+            else:
+                 logger.warning("HTTPX process produced no output.")
                 
         except Exception as e:
             logger.error(f"Failed to process ports file with httpx: {e}")
     # ---------------------------------------------------------------------
 
-    logger.warning(urls)
+    logger.warning(f"Final URL list for FFUF: {urls}")
 
     # [ORIGINEEL] - Loop door URLs en voer commando uit
     # Vanaf hier is alles precies zoals het originele bestand
     results = []
     for url in urls:
         # [ORIGINEEL] - URL voorbereiding
+        # Gebruik urlparse en bouw de URL correct op met scheme
         url_parse = urlparse(url)
-        url = url_parse.scheme + '://' + url_parse.netloc
-        url += '/FUZZ' 
+        # Zorg ervoor dat het scheme (http of https) behouden blijft!
+        if url_parse.scheme:
+             url = f"{url_parse.scheme}://{url_parse.netloc}"
+        else:
+             # Fallback als er om een of andere reden geen scheme is
+             url = f"http://{url_parse.netloc}"
+             
+        # FFUF placeholder
+        if not url.endswith('/FUZZ'):
+            url += '/FUZZ'
+
         proxy = get_random_proxy()
 
         # [ORIGINEEL] - Commando afronden
@@ -1829,237 +1866,212 @@ def dir_file_fuzz(self, ctx={}, description=None):
 
 @app.task(name='fetch_url', queue='main_scan_queue', base=RengineTask, bind=True)
 def fetch_url(self, urls=[], ctx={}, description=None):
-	"""Fetch URLs using different tools like gauplus, gau, gospider, waybackurls ...
+    """Fetch URLs using different tools like gauplus, gau, gospider, waybackurls ..."""
+    
+    input_path = f'{self.results_dir}/input_endpoints_fetch_url.txt'
+    proxy = get_random_proxy()
 
-	Args:
-		urls (list): List of URLs to start from.
-		description (str, optional): Task description shown in UI.
-	"""
-	input_path = f'{self.results_dir}/input_endpoints_fetch_url.txt'
-	proxy = get_random_proxy()
+    # Config (Origineel)
+    config = self.yaml_configuration.get(FETCH_URL) or {}
+    should_remove_duplicate_endpoints = config.get(REMOVE_DUPLICATE_ENDPOINTS, True)
+    duplicate_removal_fields = config.get(DUPLICATE_REMOVAL_FIELDS, ENDPOINT_SCAN_DEFAULT_DUPLICATE_FIELDS)
+    enable_http_crawl = config.get(ENABLE_HTTP_CRAWL, DEFAULT_ENABLE_HTTP_CRAWL)
+    gf_patterns = config.get(GF_PATTERNS, DEFAULT_GF_PATTERNS)
+    ignore_file_extension = config.get(IGNORE_FILE_EXTENSION, DEFAULT_IGNORE_FILE_EXTENSIONS)
+    tools = config.get(USES_TOOLS, ENDPOINT_SCAN_DEFAULT_TOOLS)
+    threads = config.get(THREADS) or self.yaml_configuration.get(THREADS, DEFAULT_THREADS)
+    custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
+    custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
+    if custom_header:
+        custom_headers.append(custom_header)
+    exclude_subdomains = config.get(EXCLUDED_SUBDOMAINS, False)
 
-	# Config
-	config = self.yaml_configuration.get(FETCH_URL) or {}
-	should_remove_duplicate_endpoints = config.get(REMOVE_DUPLICATE_ENDPOINTS, True)
-	duplicate_removal_fields = config.get(DUPLICATE_REMOVAL_FIELDS, ENDPOINT_SCAN_DEFAULT_DUPLICATE_FIELDS)
-	enable_http_crawl = config.get(ENABLE_HTTP_CRAWL, DEFAULT_ENABLE_HTTP_CRAWL)
-	gf_patterns = config.get(GF_PATTERNS, DEFAULT_GF_PATTERNS)
-	ignore_file_extension = config.get(IGNORE_FILE_EXTENSION, DEFAULT_IGNORE_FILE_EXTENSIONS)
-	tools = config.get(USES_TOOLS, ENDPOINT_SCAN_DEFAULT_TOOLS)
-	threads = config.get(THREADS) or self.yaml_configuration.get(THREADS, DEFAULT_THREADS)
-	# domain_request_headers = self.domain.request_headers if self.domain else None
-	custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
-	'''
-	# TODO: Remove custom_header in next major release
-		support for custom_header will be remove in next major release, 
-		as of now it will be supported for backward compatibility
-		only custom_headers will be supported
-	'''
-	custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
-	if custom_header:
-		custom_headers.append(custom_header)
-	exclude_subdomains = config.get(EXCLUDED_SUBDOMAINS, False)
+    # Get URLs to scan and save to input file (Origineel)
+    if urls:
+        with open(input_path, 'w') as f:
+            f.write('\n'.join(urls))
+    else:
+        urls = get_http_urls(
+            is_alive=enable_http_crawl,
+            write_filepath=input_path,
+            exclude_subdomains=exclude_subdomains,
+            get_only_default_urls=True,
+            ctx=ctx
+        )
 
-	# Get URLs to scan and save to input file
-	if urls:
-		with open(input_path, 'w') as f:
-			f.write('\n'.join(urls))
-	else:
-		urls = get_http_urls(
-			is_alive=enable_http_crawl,
-			write_filepath=input_path,
-			exclude_subdomains=exclude_subdomains,
-			get_only_default_urls=True,
-			ctx=ctx
-		)
+    # Domain regex - AANGEPAST VOOR CORRECTHEID
+    host = self.domain.name if self.domain else urlparse(urls[0]).netloc
+    
+    # [AANPASSING 1]
+    # Oude regex: f"\'https?://([a-z0-9]+[.])*{host}.*\'"
+    # Probleem: .* pakte ook tekst NA de url (zoals ' - [200 OK]').
+    # Nieuwe regex: [^ ]* zorgt dat hij stopt bij de eerste spatie. Hierdoor houden we schone URLs over.
+    # We staan ook poorten toe met (:[0-9]+)?
+    host_regex = f"\'https?://([a-z0-9\.-]+\.)?{host}(:[0-9]+)?(/[^ ]*)?\'"
 
-	# Domain regex
-	host = self.domain.name if self.domain else urlparse(urls[0]).netloc
-	host_regex = f"\'https?://([a-z0-9]+[.])*{host}.*\'"
+    # Tools cmds (Origineel)
+    cmd_map = {
+        'gau': f'gau',
+        'hakrawler': 'hakrawler -subs -u',
+        'waybackurls': 'waybackurls',
+        'gospider': f'gospider -S {input_path} --js -d 2 --sitemap --robots -w -r',
+        'katana': f'katana -list {input_path} -silent -jc -jsl -kf all -d 3 -fs rdn',
+    }
+    
+    # Proxy en Threads logica (Origineel)
+    if proxy:
+        cmd_map['gau'] += f' --proxy "{proxy}"'
+        cmd_map['gospider'] += f' -p {proxy}'
+        cmd_map['hakrawler'] += f' -proxy {proxy}'
+        cmd_map['katana'] += f' -proxy {proxy}'
+    if threads > 0:
+        cmd_map['gau'] += f' --threads {threads}'
+        cmd_map['gospider'] += f' -t {threads}'
+        cmd_map['katana'] += f' -c {threads}'
+    if custom_headers:
+        formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
+        cmd_map['gospider'] += formatted_headers
+        cmd_map['hakrawler'] += ';;'.join(header for header in custom_headers)
+        cmd_map['katana'] += formatted_headers
+        
+    # Command constructie (Origineel)
+    cat_input = f'cat {input_path}'
+    
+    # Doordat we de regex verbeterd hebben, werkt grep -Eo nu veel schoner
+    grep_output = f'grep -aEo {host_regex}'
+    
+    cmd_map = {
+        tool: f'{cat_input} | {cmd} | {grep_output} > {self.results_dir}/urls_{tool}.txt'
+        for tool, cmd in cmd_map.items()
+    }
+    
+    tasks = group(
+        run_command.si(cmd, shell=True, scan_id=self.scan_id, activity_id=self.activity_id)
+        for tool, cmd in cmd_map.items()
+        if tool in tools
+    )
 
-	# Tools cmds
-	cmd_map = {
-		'gau': f'gau',
-		'hakrawler': 'hakrawler -subs -u',
-		'waybackurls': 'waybackurls',
-		'gospider': f'gospider -S {input_path} --js -d 2 --sitemap --robots -w -r',
-		'katana': f'katana -list {input_path} -silent -jc -jsl -kf all -d 3 -fs rdn',
-	}
-	if proxy:
-		cmd_map['gau'] += f' --proxy "{proxy}"'
-		cmd_map['gospider'] += f' -p {proxy}'
-		cmd_map['hakrawler'] += f' -proxy {proxy}'
-		cmd_map['katana'] += f' -proxy {proxy}'
-	if threads > 0:
-		cmd_map['gau'] += f' --threads {threads}'
-		cmd_map['gospider'] += f' -t {threads}'
-		cmd_map['katana'] += f' -c {threads}'
-	if custom_headers:
-		# gau, waybackurls does not support custom headers
-		formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
-		cmd_map['gospider'] += formatted_headers
-		cmd_map['hakrawler'] += ';;'.join(header for header in custom_headers)
-		cmd_map['katana'] += formatted_headers
-	cat_input = f'cat {input_path}'
-	grep_output = f'grep -Eo {host_regex}'
-	cmd_map = {
-		tool: f'{cat_input} | {cmd} | {grep_output} > {self.results_dir}/urls_{tool}.txt'
-		for tool, cmd in cmd_map.items()
-	}
-	tasks = group(
-		run_command.si(
-			cmd,
-			shell=True,
-			scan_id=self.scan_id,
-			activity_id=self.activity_id)
-		for tool, cmd in cmd_map.items()
-		if tool in tools
-	)
+    # Cleanup task (Origineel)
+    sort_output = [
+        f'cat {self.results_dir}/urls_* > {self.output_path}',
+        f'cat {input_path} >> {self.output_path}',
+        f'sort -u {self.output_path} -o {self.output_path}',
+    ]
+    if ignore_file_extension:
+        ignore_exts = '|'.join(ignore_file_extension)
+        grep_ext_filtered_output = [
+            f'cat {self.output_path} | grep -Eiv "\\.({ignore_exts}).*" > {self.results_dir}/urls_filtered.txt',
+            f'mv {self.results_dir}/urls_filtered.txt {self.output_path}'
+        ]
+        sort_output.extend(grep_ext_filtered_output)
+        
+    cleanup = chain(
+        run_command.si(cmd, shell=True, scan_id=self.scan_id, activity_id=self.activity_id)
+        for cmd in sort_output
+    )
 
-	# Cleanup task
-	sort_output = [
-		f'cat {self.results_dir}/urls_* > {self.output_path}',
-		f'cat {input_path} >> {self.output_path}',
-		f'sort -u {self.output_path} -o {self.output_path}',
-	]
-	if ignore_file_extension:
-		ignore_exts = '|'.join(ignore_file_extension)
-		grep_ext_filtered_output = [
-			f'cat {self.output_path} | grep -Eiv "\\.({ignore_exts}).*" > {self.results_dir}/urls_filtered.txt',
-			f'mv {self.results_dir}/urls_filtered.txt {self.output_path}'
-		]
-		sort_output.extend(grep_ext_filtered_output)
-	cleanup = chain(
-		run_command.si(
-			cmd,
-			shell=True,
-			scan_id=self.scan_id,
-			activity_id=self.activity_id)
-		for cmd in sort_output
-	)
+    # Run all commands (Origineel)
+    task = chord(tasks)(cleanup)
+    with allow_join_result():
+        task.get()
 
-	# Run all commands
-	task = chord(tasks)(cleanup)
-	with allow_join_result():
-		task.get()
+    # Store all the endpoints
+    with open(self.output_path) as f:
+        discovered_urls = f.readlines()
+        self.notify(fields={'Discovered URLs': len(discovered_urls)})
 
-	# Store all the endpoints and run httpx
-	with open(self.output_path) as f:
-		discovered_urls = f.readlines()
-		self.notify(fields={'Discovered URLs': len(discovered_urls)})
+    # [AANPASSING 2] - Opgeschoonde logica voor het verwerken van URLs
+    all_urls = []
+    for url in discovered_urls:
+        url = url.strip()
+        
+        # Omdat we grep -Eo met een slimme regex hebben gebruikt, is de meeste 'rommel' al weg.
+        # We checken alleen nog of het een valide URL is.
+        if not url:
+            continue
 
-	# Some tools can have an URL in the format <URL>] - <PATH> or <URL> - <PATH>, add them
-	# to the final URL list
-	all_urls = []
-	for url in discovered_urls:
-		url = url.strip()
-		urlpath = None
-		base_url = None
-		if '] ' in url: # found JS scraped endpoint e.g from gospider
-			split = tuple(url.split('] '))
-			if not len(split) == 2:
-				logger.warning(f'URL format not recognized for "{url}". Skipping.')
-				continue
-			base_url, urlpath = split
-			urlpath = urlpath.lstrip('- ')
-		elif ' - ' in url: # found JS scraped endpoint e.g from gospider
-			base_url, urlpath = tuple(url.split(' - '))
+        # In het zeldzame geval dat er toch nog '[...]' voor staat (zou niet moeten met grep -o),
+        # proberen we het schoon te maken.
+        if '] ' in url:
+            parts = url.split('] ')
+            if len(parts) > 1:
+                url = parts[-1] # Pak het laatste deel, dat is meestal de URL
+        
+        # Verwijder de " - " logica die hier stond. Die functie brak de URLs en verwijderde parameters.
+        # De originele code probeerde de URL opnieuw op te bouwen met 'starting_point_path', wat fout is.
 
-		if base_url and urlpath:
-			subdomain = urlparse(base_url)
-			url = f'{subdomain.scheme}://{subdomain.netloc}{self.starting_point_path}'
+        if not validators.url(url):
+            # Probeer nog 1 keer te kijken of de URL in de tekst zit
+            match = re.search(r"https?://[^ ]+", url)
+            if match:
+                url = match.group(0)
+            
+            if not validators.url(url):
+                # logger.warning(f'Invalid URL "{url}". Skipping.')
+                continue
 
-		if not validators.url(url):
-			logger.warning(f'Invalid URL "{url}". Skipping.')
+        if url not in all_urls:
+            all_urls.append(url)
 
-		if url not in all_urls:
-			all_urls.append(url)
+    # Filter out URLs if a path filter was passed (Origineel)
+    if self.starting_point_path:
+        all_urls = [url for url in all_urls if self.starting_point_path in url]
 
-	# Filter out URLs if a path filter was passed
-	if self.starting_point_path:
-		all_urls = [url for url in all_urls if self.starting_point_path in url]
+    # if exclude_paths is found (Origineel)
+    if self.excluded_paths:
+        all_urls = exclude_urls_by_patterns(self.excluded_paths, all_urls)
 
-	# if exclude_paths is found, then remove urls matching those paths
-	if self.excluded_paths:
-		all_urls = exclude_urls_by_patterns(self.excluded_paths, all_urls)
+    # Write result to output path (Origineel)
+    with open(self.output_path, 'w') as f:
+        f.write('\n'.join(all_urls))
+    logger.warning(f'Found {len(all_urls)} usable URLs')
 
-	# Write result to output path
-	with open(self.output_path, 'w') as f:
-		f.write('\n'.join(all_urls))
-	logger.warning(f'Found {len(all_urls)} usable URLs')
+    # Crawl discovered URLs (Origineel)
+    if enable_http_crawl:
+        ctx['track'] = False
+        http_crawl(
+            all_urls,
+            ctx=ctx,
+            should_remove_duplicate_endpoints=should_remove_duplicate_endpoints,
+            duplicate_removal_fields=duplicate_removal_fields
+        )
 
-	# Crawl discovered URLs
-	if enable_http_crawl:
-		ctx['track'] = False
-		http_crawl(
-			all_urls,
-			ctx=ctx,
-			should_remove_duplicate_endpoints=should_remove_duplicate_endpoints,
-			duplicate_removal_fields=duplicate_removal_fields
-		)
+    # GF PATTERNS MATCH (Origineel)
+    if gf_patterns:
+        self.scan.used_gf_patterns = ','.join(gf_patterns)
+        self.scan.save()
 
+    for gf_pattern in gf_patterns:
+        if gf_pattern == 'jsvar':
+            continue
 
-	#-------------------#
-	# GF PATTERNS MATCH #
-	#-------------------#
+        gf_output_file = f'{self.results_dir}/gf_patterns_{gf_pattern}.txt'
+        # Ook hier profiteren we van de betere host_regex
+        cmd = f'cat {self.output_path} | gf {gf_pattern} | grep -Eo {host_regex} >> {gf_output_file}'
+        run_command(cmd, shell=True, history_file=self.history_file, scan_id=self.scan_id, activity_id=self.activity_id)
 
-	# Combine old gf patterns with new ones
-	if gf_patterns:
-		self.scan.used_gf_patterns = ','.join(gf_patterns)
-		self.scan.save()
+        if not os.path.exists(gf_output_file):
+            continue
 
-	# Run gf patterns on saved endpoints
-	# TODO: refactor to Celery task
-	for gf_pattern in gf_patterns:
-		# TODO: js var is causing issues, removing for now
-		if gf_pattern == 'jsvar':
-			logger.info('Ignoring jsvar as it is causing issues.')
-			continue
+        with open(gf_output_file, 'r') as f:
+            lines = f.readlines()
 
-		# Run gf on current pattern
-		logger.warning(f'Running gf on pattern "{gf_pattern}"')
-		gf_output_file = f'{self.results_dir}/gf_patterns_{gf_pattern}.txt'
-		cmd = f'cat {self.output_path} | gf {gf_pattern} | grep -Eo {host_regex} >> {gf_output_file}'
-		run_command(
-			cmd,
-			shell=True,
-			history_file=self.history_file,
-			scan_id=self.scan_id,
-			activity_id=self.activity_id)
+        for url in lines:
+            http_url = sanitize_url(url)
+            subdomain_name = get_subdomain_from_url(http_url)
+            subdomain, _ = save_subdomain(subdomain_name, ctx=ctx)
+            if not subdomain: continue
+            endpoint, created = save_endpoint(http_url, crawl=False, subdomain=subdomain, ctx=ctx)
+            if not endpoint: continue
+            
+            earlier_pattern = None
+            if not created:
+                earlier_pattern = endpoint.matched_gf_patterns
+            pattern = f'{earlier_pattern},{gf_pattern}' if earlier_pattern else gf_pattern
+            endpoint.matched_gf_patterns = pattern
+            endpoint.save()
 
-		# Check output file
-		if not os.path.exists(gf_output_file):
-			logger.error(f'Could not find GF output file {gf_output_file}. Skipping GF pattern "{gf_pattern}"')
-			continue
-
-		# Read output file line by line and
-		with open(gf_output_file, 'r') as f:
-			lines = f.readlines()
-
-		# Add endpoints / subdomains to DB
-		for url in lines:
-			http_url = sanitize_url(url)
-			subdomain_name = get_subdomain_from_url(http_url)
-			subdomain, _ = save_subdomain(subdomain_name, ctx=ctx)
-			if not subdomain:
-				continue
-			endpoint, created = save_endpoint(
-				http_url,
-				crawl=False,
-				subdomain=subdomain,
-				ctx=ctx)
-			if not endpoint:
-				continue
-			earlier_pattern = None
-			if not created:
-				earlier_pattern = endpoint.matched_gf_patterns
-			pattern = f'{earlier_pattern},{gf_pattern}' if earlier_pattern else gf_pattern
-			endpoint.matched_gf_patterns = pattern
-			endpoint.save()
-
-	return all_urls
-
-
+    return all_urls
 def parse_curl_output(response):
 	# TODO: Enrich from other cURL fields.
 	CURL_REGEX_HTTP_STATUS = f'HTTP\/(?:(?:\d\.?)+)\s(\d+)\s(?:\w+)'
